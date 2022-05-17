@@ -99,6 +99,7 @@ loss_function2 = modules.new_loss_function
 # Now, 'loss_function2' also computes loss between 'ann_out' & 'snn_out' by MSE or CosineSimilarity as defined above
 
 
+# Optimizers are algorithms or methods used to minimize an error function
 # ---------------------- Define 'optimizer1' ---------------------------------------------------------------------------
 if optimizer == 'sgd':
     optimizer1 = optim.SGD(ann_train_module.parameters(),
@@ -261,6 +262,7 @@ for epoch in range(start_epoch, start_epoch + epoch):
 #
 ########################################################################################################################
 dataset = train_dataloader.dataset
+
 # divide 'dataset' (50000 images) into 'train_set' (40000 images) and 'val_set' (10000 images)
 train_set, val_set = torch.utils.data.random_split(dataset, [40000, 10000])
 
@@ -277,7 +279,12 @@ val_dataloader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_w
 #       'epoch'
 model.load_state_dict(torch.load('train_vgg16_cifar10/vgg16_cifar10.pth')['net'])
 
-# ----------------------------Don't understand--------------------------------------------------------------------------
+
+
+# ----------------------------  Scaling--------------------------------------------------------------------------
+# Feature scaling in machine learning is one of the most critical steps during the pre-processing of data before
+# creating a machine learning model.
+# Use scaling to normalize all features of model for better evaluating the loss
 if sharescale:
     first_scale = None
     sharescale = nn.Parameter(torch.Tensor([scale_init]))

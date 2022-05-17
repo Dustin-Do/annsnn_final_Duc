@@ -13,213 +13,99 @@ from utils import *
 import numpy as np
 import torch.nn.functional as F
 
-model_names = sorted(name for name in models.__dict__ if
-                     name.islower() and not name.startswith('__') and callable(models.__dict__[name]))
+model_name = 'vgg16'
+device = 'cuda'
+dataset = 'cifar10'
+optimizer = 'sgd'
 
-parser = argparse.ArgumentParser(description='Trainer')
-parser.add_argument('--pretrain', default='train_vgg16_cifar10_demo', help='Model dir.')
+batch_size = 50
+momentum = 0.9
+decay = 1e-4
+lr = 0.1
+lam = 0.1
+inspect_interval = 100
+acc_tolerance = 0.1
+epoch = 200
 
-parser.add_argument('--optimizer', type=str, default='sgd', choices=['sgd', 'adam'], help='Choice of optimizer.')
-parser.add_argument('--epoch', type=int, default=200, help='Number of epochs to train.')
-parser.add_argument('--batch_size', type=int, default=50, help='Batch size.')
-parser.add_argument('--lr', type=float, default=0.01, help='Global learning rate.')
-parser.add_argument('--momentum', type=float, default=0.9, help='Momentum.')
-parser.add_argument('--decay', type=float, default=1e-4, help='Weight decay (L2 penalty).')
-parser.add_argument('--dropout', type=float, default=0.01, help='Dropout applied to the model.')
 
-parser.add_argument('--schedule', type=int, nargs='+', default=[100, 150],
-                    help='Decrease learning rate at these epochs.')
-parser.add_argument('--gammas', type=float, nargs='+', default=[0.1, 0.1],
-                    help='LR is multiplied by gamma on schedule, number of gammas should be equal to schedule')
-parser.add_argument('--device', type=str, default='cuda:0',
-                    choices=['cpu', 'cuda:0', 'cuda:1', 'cuda:2', 'cuda:3', 'cuda:4', 'cuda:5', 'cuda:6', 'cuda:7', 'cuda:8', 'cuda:9', 'cuda:10']
-                    , help='Device.')
+conf = [model_name,dataset]
+save_name = '_'.join(conf) # 'save_name' = concatenation of all elements of 'conf'
+log_dir = 'train_' + save_name
+if not os.path.isdir(log_dir): # if 'log_dir' is not a directory
+    os.makedirs(log_dir) # create path 'log_dir'
 
-parser.add_argument('--lam', type=float, default=0.1, help='multiplied with omega')
-parser.add_argument('--acc_tolerance', type=float, default=0.03, help='accuracy tolerance')
-parser.add_argument('--sharescale', default=False, action='store_true', help='Disable scale share.')
-parser.add_argument('--suffix', type=str, default='', help='model save name suffix')
+writer = SummaryWriter(log_dir)
 
-parser.add_argument('--init', type=float, default=4, help='init scale.')
 
-args = parser.parse_args()
-args.args = os.path.join(args.pretrain,'config.json')
-with open(args.args, 'r') as fp:
-    d = json.load(fp)
+# Define the model to be used is 'vgg16'
+model = models.__dict__[model_name](num_classes=10, dropout=0)
 
-args.dataset = d['dataset']
-args.no_data_aug = d['no_data_aug']
-args.model = d['model']
-args.log_dir = d['log_dir']
-log_dir = args.log_dir
-args.load_name = os.path.join(args.log_dir, d['save_name'] + args.suffix + '.pth')
-args.save_name = d['save_name']
 
-with open(os.path.join(log_dir, 'config2.json'), 'w') as fw:
-    json.dump(vars(args), fw)
-
-args.num_classes = num_classes[args.dataset]
-args.device = args.device if args.device else 'cuda' if torch.cuda.is_available() else 'cpu'
-assert len(args.gammas) == len(args.schedule)
-print(args.log_dir)
-print_args(args)
-
-if not os.path.isdir(log_dir):
-    os.makedirs(log_dir)
-with open(os.path.join(log_dir, 'config.json'), 'w') as fw:
-    json.dump(vars(args), fw)
-train_dataloader, test_dataloader = load_cv_data(data_aug=False,
-                                                 batch_size=args.batch_size,
-                                                 workers=0,
-                                                 dataset=args.dataset,
-                                                 data_target_dir=datapath[args.dataset]
-                                                 )
-best_acc = 0.0
-best_avg_k = 1e5
-start_epoch = 0
-sum_k = 0.0
-cnt_k = 0.0
-train_batch_cnt = 0
-test_batch_cnt = 0
-model = models.__dict__[args.model](num_classes=args.num_classes, dropout=args.dropout)
-
-model = modules.replace_maxpool2d_by_avgpool2d(model)
-model = modules.replace_relu_by_spikingnorm(model, True)
-
-if args.load_name and os.path.isfile(args.load_name):
-    # Load checkpoint.
-    print('==> Resuming from checkpoint..')
-    checkpoint = torch.load(args.load_name)
-    model.load_state_dict(checkpoint['net'])
-    best_acc = checkpoint['acc']
-    start_epoch = checkpoint['epoch']
-else:
-    for m in model.modules():
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, val=1)
-            nn.init.zeros_(m.bias)
-
-# ------------------------Specify simulating configuration------------------------
-model.to(args.device)
-args.device = torch.device(args.device)
-if args.device.type == 'cuda':
-    print(f"=> cuda memory allocated: {torch.cuda.memory_allocated(args.device.index)}")
-# --------------------------------------------------------------------------------
-
-# ----------------------------Still don't understand----------------------------
-if args.sharescale:
-    first_scale = None
-    sharescale = Parameter(torch.Tensor([args.init])) # for vgg16: 2.5                 for resnet ??5
-    for m in model.modules():
-        if isinstance(m, modules.SpikingNorm) and first_scale is None:
-            first_scale = m.scale
-        elif isinstance(m, modules.SpikingNorm) and first_scale is not None:
-            setattr(m, 'scale', first_scale)
-        if isinstance(m, modules.SpikingNorm):
-            setattr(m, 'scale', sharescale)
-else:
-    for m in model.modules():
-        if isinstance(m, modules.SpikingNorm):
-            m.scale.data *= args.init / m.scale.data
-# ----------------------------------------------------------------------
-
+# Index 'ann_train_module' and 'snn_train_module' as modules which are already defined
 ann_train_module = nn.ModuleList()
 snn_train_module = nn.ModuleList()
 
 
-def divide_trainable_modules(model):
-    global ann_train_module, snn_train_module
-    for name, module in model._modules.items():
-        if hasattr(module, "_modules"):
-            model._modules[name] = divide_trainable_modules(module)
-        if module.__class__.__name__ != "Sequential":
-            if module.__class__.__name__ == "SpikingNorm":
-                snn_train_module.append(module)
-            else:
-                ann_train_module.append(module)
-    return model
+# 'load_cv_data' is function defined in 'utils.py'
+# datasets are defined: 'cifar10', 'cifar100', 'mnist', 'imagenet'
+train_dataloader, test_dataloader = load_cv_data(data_aug=False,
+                 batch_size=batch_size,
+                 workers=0,
+                 dataset=dataset,
+                 data_target_dir=datapath[dataset]
+                 )
 
 
-divide_trainable_modules(model)
-
-
-# Instead of using Cross Entropy to cal loss as in 'para_train.py', in here, we define a 'new_loss_function'
 def new_loss_function(ann_out, snn_out, k, func='cos'):
+    print('new_loss_function')
     if func == 'mse':
         f = nn.MSELoss()
-        diff_loss = f(ann_out, snn_out)
+        diff_loss = f(ann_out, snn_out) # assign 'diff_loss' equal to MSE between 'ann_out' and 'snn_out'
     elif func == 'cos':
-        f = nn.CosineSimilarity(dim=1, eps=1e-6)
+        f = nn.CosineSimilarity(dim=1, eps=1e-6) # read more about CosineSimilarity func: https://pytorch.org/docs/stable/generated/torch.nn.CosineSimilarity.html
         diff_loss = 1.0 - torch.mean(f(ann_out, snn_out))
     else:
         assert False
-    loss = diff_loss + args.lam * k
+    loss = diff_loss + lam * k
     return loss, diff_loss
 
-
 loss_function1 = nn.CrossEntropyLoss()
-loss_function2 = new_loss_function
+loss_function2 = new_loss_function()
 
+dataset = train_dataloader.dataset
+# divide 'dataset' (50000 images) into 'train_set' (40000 images) and 'val_set' (10000 images)
+train_set, val_set = torch.utils.data.random_split(dataset, [40000, 10000])
 
-# ----------------------------Choose optimizing method----------------------------
-if args.optimizer == 'sgd':
+# load data from 'train_set' and 'val_set' and save to 'train_dataloader' and 'val_data_loader'
+train_dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+val_dataloader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+
+# --------------------------Define optimizer----------------------------------------------------------------------------
+if optimizer == 'sgd':
     optimizer2 = optim.SGD(snn_train_module.parameters(),
-                           momentum=args.momentum,
-                           lr=args.lr,
-                           weight_decay=args.decay)
-elif args.optimizer == 'adam':
+                           momentum=momentum,
+                           lr=lr,
+                           weight_decay=decay)
+elif optimizer == 'adam':
     optimizer2 = optim.Adam(snn_train_module.parameters(),
-                           lr=args.lr,
-                           weight_decay=args.decay)
-# --------------------------------------------------------------------------------
-
-# --------------------------------Save running time-------------------------------
-from datetime import datetime
-current_time = datetime.now().strftime('%b%d_%H-%M-%S')
-writer = SummaryWriter(log_dir + '/' + 'runs_' + current_time)
-# --------------------------------------------------------------------------------
+                           lr=lr,
+                           weight_decay=decay)
+# ----------------------------------------------------------------------------------------------------------------------
 
 
-def adjust_learning_rate(optimizer, epoch):
-    print('Start adjust_learning_rate')
-    global args
-    lr = args.lr
-    for (gamma, step) in zip(args.gammas, args.schedule):
-        if (epoch >= step):
-            lr = lr * gamma
-        else:
-            break
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-
-sum_k = 0
-cnt_k = 0
-last_k = 0
-test_batch_cnt = 0
-train_batch_cnt = 0
-
-
-def layerwise_k(a, max=1.0):
-    return torch.sum(a / max) / (torch.pow(torch.norm(a / max, 2), 2) + 1e-5)
-
-
-def hook(module, input, output):
-    global sum_k, cnt_k
-    sum_k += layerwise_k(output)
-    cnt_k += 1
-    return
-
-
-def snn_train(epoch, args):
-    print('Start snn_train')
+# 1.same as 'snn_train' function in 'fast_train.py'
+# 2.'snn_train' uses 'train_dataloader' to train the model, it trains ANN and SNN, then compare results
+# 3.outputs:
+#       'snn_dist_loss', 'snn_fast_loss':
+#                Two losses are considered ('fast_loss' and 'dist_lost'), which are loss between ANN & SNN training outputs
+#                'snn_dist_loss' is cumulation of 'dist_loss'
+#       'snn_correct': nb of same elements between 'snn_predicted' and 'targets' of SNN (not output of ANN training)
+def snn_train(epoch):
+    print('\n *****snn_train*****')
     global sum_k, cnt_k, train_batch_cnt, last_k
-    net = model.to(args.device)
+    net = model.to(device)
 
-    print('\n (SNN train) Epoch: %d Fast Train' % epoch)
+    print('\nEpoch: %d Fast Train' % epoch)
     net.train()
     snn_fast_loss = 0
     snn_dist_loss = 0
@@ -229,12 +115,13 @@ def snn_train(epoch, args):
     handles = []
     for m in net.modules():
         if isinstance(m, modules.SpikingNorm):
-            handles.append(m.register_forward_hook(hook))
+            handles.append(m.register_forward_hook(modules.hook))
 
     for batch_idx, (inputs, targets) in enumerate(tqdm(train_dataloader)):
         sum_k = 0
         cnt_k = 0
-        inputs, targets = inputs.to(args.device), targets.to(args.device)
+        # ----------------------Run ANN training------------------------------------------------------------------------
+        inputs, targets = inputs.to(device), targets.to(device)
         ann_outputs = net(inputs)
         ann_loss = loss_function1(ann_outputs, targets)
 
@@ -242,12 +129,26 @@ def snn_train(epoch, args):
             print('encounter ann_loss', ann_loss)
             return False
 
+        # 'detach()' method constructs a new view on a tensor which is declared not to need gradients, i.e., it is
+        # to be excluded from further tracking of operations, and therefore the subgraph involving this view is not recorded.
         predict_outputs = ann_outputs.detach()
         _, ann_predicted = predict_outputs.max(1)
+        # --------------------------------------------------------------------------------------------------------------
 
+        # ----------------------Run SNN training------------------------------------------------------------------------
         snn_outputs = net(inputs)
-        last_k = layerwise_k(F.relu(snn_outputs), torch.max(snn_outputs))
+
+        # 'F.relu(snn_outputs)' returns positive elements, others are set to 0
+        # 'torch.mac(snn_outputs)' return max element of 'snn_outputs'
+        # 'layerwise_k' is defined above
+        last_k = modules.layerwise_k(F.relu(snn_outputs), torch.max(snn_outputs))
+
+        # 'predict_outputs' is output of ANN (i.e. 'ann_outputs'), 'snn_outputs' is output of SNN
+        # 'loss_function2' uses MSE or CosineSimilarity technique to calculates difference between 'predict_outputs'
+        #  (returned by ANN) and 'snn_outputs'.
+        # fast_loss = dist_loss + lam * [(sum_k + last_k) / (cnt_k + 1)]
         fast_loss, dist_loss = loss_function2(predict_outputs, snn_outputs, (sum_k + last_k) / (cnt_k + 1))
+
         snn_dist_loss += dist_loss.item()
         snn_fast_loss += fast_loss.item()
         optimizer2.zero_grad()
@@ -259,12 +160,22 @@ def snn_train(epoch, args):
         total += tot
         sc = snn_predicted.eq(targets).sum().item()
         snn_correct += sc
+        # --------------------------------------------------------------------------------------------------------------
 
+        # The SummaryWriter class ('writer') is your main entry to log data for consumption and visualization by TensorBoard
+        # Log 4 parameters of each loop (1 LOOP FOR 1 PICTURE ?) for later consumption and visualization
+        # syntax: writer.add_scalar('',y,x)
         writer.add_scalar('Train/Acc', sc / tot, train_batch_cnt)
         writer.add_scalar('Train/DistLoss', dist_loss, train_batch_cnt)
         writer.add_scalar('Train/AvgK', (sum_k / cnt_k).item(), train_batch_cnt)
         writer.add_scalar('Train/LastK', last_k, train_batch_cnt)
         train_batch_cnt += 1
+
+        # 'inspect_interval' is a time interval which is used to observe the data progress
+        if train_batch_cnt % inspect_interval == 0:
+            if not snn_val(train_batch_cnt):
+                return False
+            net.train()
     print('Fast Train Epoch %d Loss:%.3f Acc:%.3f' % (epoch,
                                                       snn_dist_loss,
                                                       snn_correct / total))
@@ -275,21 +186,26 @@ def snn_train(epoch, args):
     return True
 
 
-def get_acc():
-    print('Start get_acc')
+# 1.same as 'get_acc' function in 'fast_train.py'
+# 2.output:
+#       'snn_acc': nb of same elements between 'predicted' (i.e. testing output of 'model' on 'val_dataloader') and 'targets'
+# Used to update the best accuracy to save the checkpoint in 'snn_val'.
+# Why in 'para_train_val.py', the update is contained in the file, not in separate file like in SNN case???
+def get_acc(val_dataloader):
+    print('\n *****get_acc*****')
     global model
     net = model
-    net.to(args.device)
+    net.to(device)
 
     net.eval()
     correct = 0
     total = 0
     for m in net.modules():
         if isinstance(m, modules.SpikingNorm):
-            m.snn = True
+            m.lock_max = True
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(test_dataloader):
-            inputs, targets = inputs.to(args.device), targets.to(args.device)
+        for batch_idx, (inputs, targets) in enumerate(val_dataloader):
+            inputs, targets = inputs.to(device), targets.to(device)
             outputs = net(inputs)
             _, predicted = outputs.max(1)
             total += targets.size(0)
@@ -298,24 +214,29 @@ def get_acc():
     return snn_acc
 
 
-def val(epoch, args):
+# 1.same as 'val' function in 'fast_train.py'
+# 2.same as 'para_train_val' defined above
+# 3.used for test dataset
+# 3.why 'snn_val' uses ANN training instead of SNN???
+def snn_val(iter):
+    print('\n *****snn_val*****')
     global sum_k, cnt_k, test_batch_cnt, best_acc, last_k, best_avg_k
-    net = model.to(args.device)
+    net = model.to(device)
 
     handles = []
     for m in net.modules():
         if isinstance(m, modules.SpikingNorm):
-            handles.append(m.register_forward_hook(hook))
+            handles.append(m.register_forward_hook(modules.hook))
 
     net.eval()
     ann_test_loss = 0
     ann_correct = 0
     total = 0
-    with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(tqdm(test_dataloader)):
+    with torch.no_grad(): #disable gradient calculation.
+        for batch_idx, (inputs, targets) in enumerate(tqdm(val_dataloader)):
             sum_k = 0
             cnt_k = 0
-            inputs, targets = inputs.to(args.device), targets.to(args.device)
+            inputs, targets = inputs.to(device), targets.to(device)
             ann_outputs = net(inputs)
             ann_loss = loss_function1(ann_outputs, targets)
 
@@ -332,58 +253,86 @@ def val(epoch, args):
             ac = ann_predicted.eq(targets).sum().item()
             ann_correct += ac
 
-            last_k = layerwise_k(F.relu(ann_outputs), torch.max(ann_outputs))
+            last_k = modules.layerwise_k(F.relu(ann_outputs), torch.max(ann_outputs))
+            # SummaryWriter class ('writer') is a main entry to log data for consumption, visualization by TensorBoard
             writer.add_scalar('Test/Acc', ac / tot, test_batch_cnt)
             writer.add_scalar('Test/Loss', ann_test_loss, test_batch_cnt)
             writer.add_scalar('Test/AvgK', (sum_k / cnt_k).item(), test_batch_cnt)
             writer.add_scalar('Test/LastK', last_k, test_batch_cnt)
             test_batch_cnt += 1
-        print('Test Epoch %d Loss:%.3f Acc:%.3f AvgK:%.3f LastK:%.3f' % (epoch,
+            #–––––-----------–––––-----------–––––-----------–––––-----------–––––-----------–––––-----------
+        print('Test Iter %d Loss:%.3f Acc:%.3f AvgK:%.3f LastK:%.3f' % (iter,
                                                                          ann_test_loss,
                                                                          ann_correct / total,
                                                                          sum_k / cnt_k, last_k))
-    writer.add_scalar('Test/EpochAcc', ann_correct / total, epoch)
+    writer.add_scalar('Test/IterAcc', ann_correct / total, iter)
 
     # Save checkpoint.
     avg_k = ((sum_k + last_k) / (cnt_k + 1)).item()
     acc = 100. * ann_correct / total
-    if acc > (best_acc - args.acc_tolerance)*100. and best_avg_k > avg_k:
-        print('Saving checkpoint (val(SNN))..')
+    if acc < (best_acc - acc_tolerance)*100.:
+        return False
+    if acc > (best_acc - acc_tolerance)*100. and best_avg_k > avg_k:
+        test_acc = get_acc(test_dataloader)
+        print('Saving checkpoint (snn_val)...')
         state = {
             'net': net.state_dict(),
-            'acc': acc,
+            'acc': test_acc * 100,
             'epoch': epoch,
             'avg_k': avg_k
         }
-        if not os.path.isdir(args.log_dir):
-            os.mkdir(args.log_dir)
-        torch.save(state, args.log_dir + '/%s_[%.3f_%.3f_%.3f].pth' % (args.save_name,
-                                                                       args.lam,acc,
+        if not os.path.isdir(log_dir):
+            os.mkdir(log_dir)
+        torch.save(state, log_dir + '/%s_[%.3f_%.3f_%.3f].pth' % (save_name,
+                                                                       lam,test_acc * 100,
                                                                        ((sum_k + last_k) / (cnt_k + 1)).item() ))
         best_avg_k = avg_k
 
     if (epoch + 1) % 10 == 0:
-        print('Schedule saving checkpoint (val(SNN))...')
+        print('Schedule saving checkpoint (snn_val)...')
         state = {
             'net': net.state_dict(),
             'acc': acc,
             'epoch': epoch,
         }
-        torch.save(state, args.log_dir + '/%s_ft_scheduled.pth' % (args.save_name))
+        torch.save(state, log_dir + '/%s_ft_scheduled.pth' % (save_name))
     for handle in handles:
         handle.remove()
+    return True
 
 
-best_acc = get_acc()
-print('Pretrain (best_acc): ',best_acc)
-# exit(-1)
-for epoch in range(start_epoch, start_epoch + args.epoch):
-    adjust_learning_rate(optimizer2, epoch)
-    ret = snn_train(epoch, args)
-    if ret == False:
-        exit(-1)
-    val(epoch, args)
-    print("\nThres:")
-    for n, m in model.named_modules():
-        if isinstance(m, modules.SpikingNorm):
-            print('thres', m.calc_v_th().data, 'scale', m.calc_scale().data, 'scale_t',m.scale.data)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
